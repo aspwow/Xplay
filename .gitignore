@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Package.resolved
+
+# Internal dev briefs (not for public repo)
+claude.md
+CLAUDE.md
