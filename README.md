@@ -4,6 +4,8 @@ Turn your Mac into a zero-latency, zero-branding gaming screen for a console, us
 
 ![Xplay app icon](Xplay/Assets.xcassets/AppIcon.appiconset/icon_256.png)
 
+![Xplay in windowed mode displaying a console game](screenshot/screenshot-windowed.png)
+
 ## What it does
 
 You have a Mac with a great screen — a Studio Display, an iMac, a MacBook Pro. You have a PS5, Xbox, Switch, or any HDMI source. You buy a cheap USB HDMI capture dongle (UGREEN and any MS2109/MS2130-based clone at around €30 on Amazon).
