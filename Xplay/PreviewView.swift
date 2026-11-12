@@ -7,6 +7,40 @@ import CoreMedia
 import QuartzCore
 import simd
 
+/// 与 MSL 中 PictureUniforms 严格一一对应的 12 个 Float（48 字节，align 4）。
+/// 全部用 Float 是为了避开 Swift / Metal 混合结构体的对齐差异。
+struct PictureUniforms {
+    var brightness: Float
+    var contrast: Float
+    var saturation: Float
+    var kr: Float
+    var kb: Float
+    var rangeMode: Float        // 0 = auto, 1 = force full, 2 = force limited
+    var sourceFullRange: Float  // 1 = 像素缓冲本身是 full range
+    var flipX: Float
+    var flipY: Float
+    var useNearest: Float
+    var padding0: Float
+    var padding1: Float
+
+    init(brightness: Float, contrast: Float, saturation: Float,
+         kr: Float, kb: Float, rangeMode: Float, sourceFullRange: Float,
+         flipX: Float, flipY: Float, useNearest: Float) {
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.kr = kr
+        self.kb = kb
+        self.rangeMode = rangeMode
+        self.sourceFullRange = sourceFullRange
+        self.flipX = flipX
+        self.flipY = flipY
+        self.useNearest = useNearest
+        self.padding0 = 0
+        self.padding1 = 0
+    }
+}
+
 struct PreviewView: NSViewRepresentable {
     let controller: CaptureController
 
@@ -246,17 +280,25 @@ final class MetalPreviewNSView: NSView {
         guard let cmd = commandQueue.makeCommandBuffer(),
               let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
+        // 每帧从加锁快照读一次参数，渲染线程不与 SwiftUI 主线程争用
+        let params = XplaySettings.shared.pictureSnapshot()
         let drawableSize = metalLayer.drawableSize
-        var scale = SIMD2<Float>(1, 1)
-        if drawableSize.width > 0, drawableSize.height > 0, w > 0, h > 0 {
-            let srcAspect = Double(w) / Double(h)
-            let dstAspect = drawableSize.width / drawableSize.height
-            if srcAspect > dstAspect {
-                scale.y = Float(dstAspect / srcAspect)
-            } else {
-                scale.x = Float(srcAspect / dstAspect)
-            }
-        }
+        var scale = aspectScale(sourceWidth: w, sourceHeight: h,
+                                drawableSize: drawableSize, mode: params.aspectMode)
+        let sourceIsFullRange = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+
+        var uniforms = PictureUniforms(
+            brightness: Float(params.brightness),
+            contrast: Float(params.contrast),
+            saturation: Float(params.saturation),
+            kr: Float(params.colorMatrix.kr),
+            kb: Float(params.colorMatrix.kb),
+            rangeMode: params.rangeMode.code,
+            sourceFullRange: sourceIsFullRange ? 1 : 0,
+            flipX: params.flipHorizontal ? 1 : 0,
+            flipY: params.flipVertical ? 1 : 0,
+            useNearest: params.filter == .nearest ? 1 : 0
+        )
 
         let isBiplanar = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
                        || pf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
@@ -277,8 +319,7 @@ final class MetalPreviewNSView: NSView {
                 enc.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
                 enc.setFragmentTexture(yT, index: 0)
                 enc.setFragmentTexture(cT, index: 1)
-                var fullRange: Int32 = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 1 : 0
-                enc.setFragmentBytes(&fullRange, length: MemoryLayout<Int32>.size, index: 0)
+                enc.setFragmentBytes(&uniforms, length: MemoryLayout<PictureUniforms>.size, index: 1)
                 enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             }
         } else if let pipeline = bgraPipeline {
@@ -290,6 +331,7 @@ final class MetalPreviewNSView: NSView {
                 enc.setRenderPipelineState(pipeline)
                 enc.setVertexBytes(&scale, length: MemoryLayout<SIMD2<Float>>.size, index: 0)
                 enc.setFragmentTexture(t, index: 0)
+                enc.setFragmentBytes(&uniforms, length: MemoryLayout<PictureUniforms>.size, index: 1)
                 enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
             }
         }
@@ -297,6 +339,35 @@ final class MetalPreviewNSView: NSView {
         enc.endEncoding()
         cmd.present(drawable)
         cmd.commit()
+    }
+
+    /// fit = 原版行为（等比 + 黑边）；fill = 等比铺满并裁切；stretch = 忽略比例。
+    private func aspectScale(sourceWidth: Int, sourceHeight: Int,
+                             drawableSize: CGSize, mode: AspectMode) -> SIMD2<Float> {
+        var scale = SIMD2<Float>(1, 1)
+        guard mode != .stretch,
+              drawableSize.width > 0, drawableSize.height > 0,
+              sourceWidth > 0, sourceHeight > 0 else { return scale }
+
+        let srcAspect = Double(sourceWidth) / Double(sourceHeight)
+        let dstAspect = drawableSize.width / drawableSize.height
+        switch mode {
+        case .fit:
+            if srcAspect > dstAspect {
+                scale.y = Float(dstAspect / srcAspect)
+            } else {
+                scale.x = Float(srcAspect / dstAspect)
+            }
+        case .fill:
+            if srcAspect > dstAspect {
+                scale.x = Float(srcAspect / dstAspect)
+            } else {
+                scale.y = Float(dstAspect / srcAspect)
+            }
+        case .stretch:
+            break
+        }
+        return scale
     }
 
     private func logStatsIfDue(queue: FrameQueue) {
@@ -320,6 +391,21 @@ final class MetalPreviewNSView: NSView {
         float2 uv;
     };
 
+    struct PictureUniforms {
+        float brightness;
+        float contrast;
+        float saturation;
+        float kr;
+        float kb;
+        float rangeMode;
+        float sourceFullRange;
+        float flipX;
+        float flipY;
+        float useNearest;
+        float padding0;
+        float padding1;
+    };
+
     vertex VSOut vtx_fullscreen(uint vid [[vertex_id]],
                                 constant float2 &scale [[buffer(0)]]) {
         const float2 positions[4] = {
@@ -340,38 +426,85 @@ final class MetalPreviewNSView: NSView {
         return out;
     }
 
+    float2 mappedUV(float2 uv, float flipX, float flipY) {
+        float2 r = uv;
+        if (flipX > 0.5) r.x = 1.0 - r.x;
+        if (flipY > 0.5) r.y = 1.0 - r.y;
+        return r;
+    }
+
+    // Brightness / contrast / saturation in RGB space, shared by BGRA and YUV paths.
+    float3 grade(float3 rgb, float brightness, float contrast,
+                        float saturation, float kr, float kb) {
+        float3 c = (rgb - 0.5) * contrast + 0.5 + brightness;
+        float kg = max(1.0 - kr - kb, 0.0001);
+        float luma = c.r * kr + c.g * kg + c.b * kb;
+        c = mix(float3(luma), c, float3(saturation));
+        return saturate(c);
+    }
+
     fragment float4 frag_bgra(VSOut in [[stage_in]],
-                              texture2d<float> tex [[texture(0)]]) {
-        constexpr sampler s(mag_filter::linear,
-                            min_filter::linear,
-                            address::clamp_to_edge);
-        return tex.sample(s, in.uv);
+                              texture2d<float> tex [[texture(0)]],
+                              constant PictureUniforms &u [[buffer(1)]]) {
+        constexpr sampler sLinear(mag_filter::linear,
+                                  min_filter::linear,
+                                  address::clamp_to_edge);
+        constexpr sampler sNearest(mag_filter::nearest,
+                                   min_filter::nearest,
+                                   address::clamp_to_edge);
+        float2 uv = mappedUV(in.uv, u.flipX, u.flipY);
+        float3 rgb = (u.useNearest > 0.5)
+            ? tex.sample(sNearest, uv).rgb
+            : tex.sample(sLinear, uv).rgb;
+        return float4(grade(rgb, u.brightness, u.contrast,
+                            u.saturation, u.kr, u.kb), 1.0);
     }
 
     fragment float4 frag_yuv_biplanar(VSOut in [[stage_in]],
                                       texture2d<float> yTex [[texture(0)]],
                                       texture2d<float> cTex [[texture(1)]],
-                                      constant int &fullRange [[buffer(0)]]) {
-        constexpr sampler s(mag_filter::linear,
-                            min_filter::linear,
-                            address::clamp_to_edge);
-        float Y = yTex.sample(s, in.uv).r;
-        float2 CbCr = cTex.sample(s, in.uv).rg;
-        float Cb = CbCr.x - 0.5;
-        float Cr = CbCr.y - 0.5;
+                                      constant PictureUniforms &u [[buffer(1)]]) {
+        constexpr sampler sLinear(mag_filter::linear,
+                                  min_filter::linear,
+                                  address::clamp_to_edge);
+        constexpr sampler sNearest(mag_filter::nearest,
+                                   min_filter::nearest,
+                                   address::clamp_to_edge);
+        float2 uv = mappedUV(in.uv, u.flipX, u.flipY);
 
-        if (fullRange == 0) {
+        float Y;
+        float Cb;
+        float Cr;
+        if (u.useNearest > 0.5) {
+            Y = yTex.sample(sNearest, uv).r;
+            float2 c = cTex.sample(sNearest, uv).rg;
+            Cb = c.x - 0.5;
+            Cr = c.y - 0.5;
+        } else {
+            Y = yTex.sample(sLinear, uv).r;
+            float2 c = cTex.sample(sLinear, uv).rg;
+            Cb = c.x - 0.5;
+            Cr = c.y - 0.5;
+        }
+
+        // rangeMode: 0 = follow pixel format, 1 = force full, 2 = force limited
+        bool limited = (u.rangeMode > 1.5)
+                    || (u.rangeMode < 0.5 && u.sourceFullRange < 0.5);
+        if (limited) {
             Y  = (Y - 16.0/255.0) * (255.0/219.0);
             Cb = Cb * (255.0/224.0);
             Cr = Cr * (255.0/224.0);
         }
 
-        // BT.709 limited matrix
-        float R = Y + 1.5748 * Cr;
-        float G = Y - 0.1873 * Cb - 0.4681 * Cr;
-        float B = Y + 1.8556 * Cb;
+        // Derive BT.709 / BT.601 / BT.2020 matrix from Kr / Kb.
+        float kg = max(1.0 - u.kr - u.kb, 0.0001);
+        float R = Y + 2.0 * (1.0 - u.kr) * Cr;
+        float B = Y + 2.0 * (1.0 - u.kb) * Cb;
+        float G = Y - (2.0 * u.kb * (1.0 - u.kb) / kg) * Cb
+                    - (2.0 * u.kr * (1.0 - u.kr) / kg) * Cr;
 
-        return float4(saturate(R), saturate(G), saturate(B), 1.0);
+        return float4(grade(float3(R, G, B), u.brightness, u.contrast,
+                            u.saturation, u.kr, u.kb), 1.0);
     }
     """
 }

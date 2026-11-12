@@ -31,6 +31,9 @@ struct XplayApp: App {
                     .keyboardShortcut("f", modifiers: [.command, .shift])
                 Divider()
                 FullScreenDisplayMenu()
+                Divider()
+                Button("参数设置…") { SettingsWindow.show(controller: controller) }
+                    .keyboardShortcut(",", modifiers: .command)
             }
         }
     }
@@ -100,6 +103,8 @@ private struct WindowAccessor: NSViewRepresentable {
 
         func attach(to window: NSWindow) {
             self.window = window
+            // 设置面板是悬浮窗，NSApp.keyWindow 可能指向它；全屏操作必须锁定主视频窗口
+            VideoWindowHandle.shared.window = window
             window.contentAspectRatio = lockedAspect
 
             let nc = NotificationCenter.default
@@ -127,13 +132,24 @@ private struct WindowAccessor: NSViewRepresentable {
     }
 }
 
+/// 主视频窗口的弱引用，保证设置面板打开时全屏快捷键仍作用于画面窗口。
+final class VideoWindowHandle {
+    static let shared = VideoWindowHandle()
+    weak var window: NSWindow?
+    private init() {}
+}
+
+private var targetVideoWindow: NSWindow? {
+    VideoWindowHandle.shared.window ?? NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first
+}
+
 enum FullScreen {
     static func toggle() {
-        (NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first)?.toggleFullScreen(nil)
+        targetVideoWindow?.toggleFullScreen(nil)
     }
 
     static func enterOnOther() {
-        guard let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first else { return }
+        guard let window = targetVideoWindow else { return }
         let screens = NSScreen.screens
         guard screens.count > 1 else {
             window.toggleFullScreen(nil)
@@ -145,7 +161,7 @@ enum FullScreen {
     }
 
     static func enter(on screen: NSScreen) {
-        guard let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first else { return }
+        guard let window = targetVideoWindow else { return }
         let goFS = {
             var frame = window.frame
             frame.origin = screen.frame.origin
