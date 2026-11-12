@@ -285,7 +285,15 @@ final class MetalPreviewNSView: NSView {
         let drawableSize = metalLayer.drawableSize
         var scale = aspectScale(sourceWidth: w, sourceHeight: h,
                                 drawableSize: drawableSize, mode: params.aspectMode)
-        let sourceIsFullRange = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        // 4K / 高帧率采集卡可能给 10-bit biplanar（Apple fourCC 'x420'，等价 P010）。
+        // 10-bit 样本左移 6 位存进 16-bit，用 r16Unorm / rg16Unorm 采样后归一化值
+        // 恰好等于 10bit/1023，所以着色器里的 YUV→RGB 与 full/limited 判断无需改动。
+        let isBiplanar8 = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                        || pf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        let isBiplanar10 = (pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                         || pf == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        let sourceIsFullRange = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                              || pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
 
         var uniforms = PictureUniforms(
             brightness: Float(params.brightness),
@@ -300,18 +308,18 @@ final class MetalPreviewNSView: NSView {
             useNearest: params.filter == .nearest ? 1 : 0
         )
 
-        let isBiplanar = (pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-                       || pf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+        let lumaFormat: MTLPixelFormat = isBiplanar10 ? .r16Unorm : .r8Unorm
+        let chromaFormat: MTLPixelFormat = isBiplanar10 ? .rg16Unorm : .rg8Unorm
 
-        if isBiplanar, let pipeline = yuvPipeline {
+        if (isBiplanar8 || isBiplanar10), let pipeline = yuvPipeline {
             var luma: CVMetalTexture?
             var chroma: CVMetalTexture?
             CVMetalTextureCacheCreateTextureFromImage(
                 kCFAllocatorDefault, textureCache, pb, nil,
-                .r8Unorm, w, h, 0, &luma)
+                lumaFormat, w, h, 0, &luma)
             CVMetalTextureCacheCreateTextureFromImage(
                 kCFAllocatorDefault, textureCache, pb, nil,
-                .rg8Unorm, w / 2, h / 2, 1, &chroma)
+                chromaFormat, w / 2, h / 2, 1, &chroma)
 
             if let yT = luma.flatMap(CVMetalTextureGetTexture),
                let cT = chroma.flatMap(CVMetalTextureGetTexture) {
