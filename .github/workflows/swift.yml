@@ -1,22 +1,181 @@
-# This workflow will build a Swift project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-swift
+# Xplay — GitHub Actions 云编译工作流
+# 仓库: https://github.com/ChrisLefevre/Xplay
+# 工程: Xplay.xcodeproj（共享 scheme "Xplay"），纯 Swift / 无第三方依赖 / 无单元测试 target
+# 目标: macOS 13+，工程固定 ARCHS=arm64，README 要求 Xcode 15+ 且仅支持 Apple Silicon
+# 产物: ad-hoc 签名的 Xplay.app 打包成 zip，上传为 Actions Artifact；
+#       推送 v* tag 时自动创建/更新 GitHub Release 并附上 zip。
+#
+# 使用方法：把本文件放到仓库 .github/workflows/build-macos.yml，推送后
+#   - push / PR / 手动触发 (Actions → Build Xplay → Run workflow)
+#   - 编译完成后在 Actions 运行页下载 "Xplay-macOS-<run number>" 制品
+#   - 首次打开需右键 Xplay.app → 打开（Gatekeeper），或执行
+#     xattr -dr com.apple.quarantine Xplay.app
 
-name: Swift
+name: Build Xplay (macOS)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
+    tags: ['v*']
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: '构建配置'
+        type: choice
+        required: true
+        default: Release
+        options: [Release, Debug]
+      architecture:
+        description: 'arm64 = 与工程默认一致；universal = arm64 + x86_64 双架构'
+        type: choice
+        required: true
+        default: arm64
+        options: [arm64, universal]
+      xcode:
+        description: '可选：指定 Xcode 版本（如 16.4）；留空则用 runner 默认版本'
+        type: string
+        required: false
+        default: ''
+
+# 打 tag 时需要用内置 GITHUB_TOKEN 创建 / 更新 Release
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
+    name: Build Xplay
+    # 必须是 Apple Silicon 的 macOS runner：工程 ARCHS=arm64，且 Intel runner 无法运行产物
+    # 可换成 macos-14 / macos-26（同为 arm64），不要换成 macos-13 / macos-13-large（Intel）
+    runs-on: macos-15
+    timeout-minutes: 30
 
-    runs-on: macos-latest
+    env:
+      # github.event.inputs.* 在 push / PR 事件下为空，|| 回退到默认值；手动触发时取用户输入
+      CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
+      TARGET_ARCH: ${{ github.event.inputs.architecture || 'arm64' }}
+      XCODE_VERSION: ${{ github.event.inputs.xcode || '' }}
+      DERIVED_DATA: ${{ github.workspace }}/build/DerivedData
+      OUTPUT_DIR: ${{ github.workspace }}/build
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: swift build -v
-    - name: Run tests
-      run: swift test -v
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$XCODE_VERSION" ]; then
+            APP="/Applications/Xcode_${XCODE_VERSION}.app"
+            if [ ! -d "$APP" ]; then
+              echo "::error::Xcode $XCODE_VERSION 不存在于此 runner，可用版本见 /Applications"
+              exit 1
+            fi
+            sudo xcode-select -s "$APP"
+          fi
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun swift --version
+          xcodebuild -list -project Xplay.xcodeproj
+
+      - name: Build with xcodebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTPUT_DIR"
+
+          args=(
+            -project Xplay.xcodeproj
+            -scheme Xplay
+            -configuration "$CONFIGURATION"
+            -derivedDataPath "$DERIVED_DATA"
+            -quiet
+            # 工程是 Automatic signing，CI 没有开发者账号/证书：
+            # 先完全关闭签名，编译成功后再手动做 ad-hoc 重签
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            ONLY_ACTIVE_ARCH=NO
+          )
+          if [ "$TARGET_ARCH" = "universal" ]; then
+            args+=(-destination 'platform=macOS' 'ARCHS=arm64 x86_64')
+            ARCH_LABEL=universal
+          else
+            args+=(-destination 'platform=macOS,arch=arm64' 'ARCHS=arm64')
+            ARCH_LABEL=arm64
+          fi
+
+          echo "::group::xcodebuild"
+          echo "xcodebuild ${args[*]} build"
+          xcodebuild "${args[@]}" build 2>&1 | tee "$OUTPUT_DIR/xcodebuild.log"
+          echo "::endgroup::"
+
+          APP="$DERIVED_DATA/Build/Products/$CONFIGURATION/Xplay.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::未找到产物: $APP"
+            exit 1
+          fi
+
+          # 还原 README 所说的 ad-hoc 签名（无需任何证书），并校验
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose=2 "$APP"
+
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          BUILD_NUM="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          ZIP_NAME="Xplay-${VERSION}-${BUILD_NUM}-${SHORT_SHA}-macOS-${ARCH_LABEL}.zip"
+
+          # ditto 保留 app bundle 的资源分支与可执行权限，比普通 zip 更适合分发 .app
+          (cd "$(dirname "$APP")" && ditto -c -k --sequesterRsrc --keepParent Xplay.app "$OUTPUT_DIR/$ZIP_NAME")
+
+          echo "构建产物: $OUTPUT_DIR/$ZIP_NAME"
+          lipo -archs "$APP/Contents/MacOS/Xplay"
+          du -h "$OUTPUT_DIR/$ZIP_NAME"
+          {
+            echo "### ✅ Xplay 云编译完成"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 配置 | $CONFIGURATION |"
+            echo "| 架构 | $ARCH_LABEL ($(lipo -archs "$APP/Contents/MacOS/Xplay")) |"
+            echo "| 版本 | $VERSION ($BUILD_NUM) |"
+            echo "| 提交 | $SHORT_SHA |"
+            echo ""
+            echo "下载 zip 后解压得到 Xplay.app；首次打开请右键 → 打开（或清除 quarantine 属性）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xplay-macOS-${{ github.run_number }}
+          path: build/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-${{ github.run_number }}
+          path: build/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Attach zip to GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/*.zip --clobber
+          else
+            gh release create "$TAG" build/*.zip --title "Xplay $TAG" --generate-notes
+          fi
