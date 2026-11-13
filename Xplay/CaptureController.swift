@@ -80,9 +80,10 @@ final class CaptureController: NSObject, ObservableObject {
 
     override init() {
         super.init()
-        // 不要在这里设 .high：macOS 上 session preset 会在 addInput / startRunning 时
-        // 反过来重配设备的 activeFormat，把用户选的高分辨率压回 preset 对应尺寸。
-        // 格式控制权统一在 select(device:) 里显式交给 .inputPriority。
+        // 不设置任何 sessionPreset：.inputPriority 在 macOS 是 API_UNAVAILABLE(macos)，
+        // 而主动设 .high / .hd1280x720 会让 session 更积极地在 commitConfiguration /
+        // startRunning 时按 preset 重配设备格式。格式控制权由 select(device:) 里的
+        // lockForConfiguration() 设备锁保证（macOS 官方做法）。
         let c = settings.captureSnapshot()
         audioPreview.volume = c.audioMuted ? 0 : Float(c.audioVolume)
         bindSettings()
@@ -210,89 +211,119 @@ final class CaptureController: NSObject, ObservableObject {
             self.didLogFirstFrame = false
             self.lastFrameSignature = nil
             self.lastAppliedFormatKey = nil
+            self.currentDevice = device
 
-            // ── 第 1 步：在一个原子配置块里接好输入/输出，并显式交出格式控制权 ──
-            self.session.beginConfiguration()
+            // ── macOS 专用顺序（Apple 官方）──────────────────────────────
+            // .inputPriority 在 macOS 是 API_UNAVAILABLE(macos)，不能用。
+            // macOS 上 session 在 commitConfiguration() 与 startRunning() 两个时刻
+            // 都会按 sessionPreset 自动重配设备的 activeFormat。唯一可靠的做法是：
+            // 让 lockForConfiguration() 的设备锁**同时跨过拓扑变更和 startRunning**。
+            // 参考：Apple Developer Forums thread/85173（Media Engineer 回复）、
+            // AVCaptureDevice.lockForConfiguration() 文档、AVFoundation "Formats" 文档。
+            var inputError: Error?
+            let locked = self.withDeviceLock(device) {
+                // 1) 拓扑变更：begin/commit 必须在锁内，否则 commit 就会重配格式
+                self.session.beginConfiguration()
 
-            // .high / .hd1280x720 这类 preset 会让 session 接管 activeFormat。
-            // 不显式设 inputPriority，4K/1440p 就会被压回 1280×720。
-            if self.session.canSetSessionPreset(.inputPriority) {
-                self.session.sessionPreset = .inputPriority
-            } else {
-                NSLog("StreamView: WARNING cannot set sessionPreset = inputPriority")
-            }
-
-            if let existing = self.currentVideoInput {
-                self.session.removeInput(existing)
-                self.currentVideoInput = nil
-            }
-            if let existing = self.currentAudioInput {
-                self.session.removeInput(existing)
-                self.currentAudioInput = nil
-            }
-
-            // 只请求像素格式、绝不指定宽高：让 VideoDataOutput 输出设备原生尺寸，
-            // 避免任何隐式的缩放/重采样。此时输出格式列表尚未枚举，会回退到 420f，
-            // 第 2 步枚举完再用用户选择覆盖。
-            self.videoOutput.videoSettings = [
-                kCVPixelBufferPixelFormatTypeKey as String: self.resolveOutputFormat()
-            ]
-            self.videoOutput.alwaysDiscardsLateVideoFrames = true
-            if !self.session.outputs.contains(self.videoOutput) {
-                self.videoOutput.setSampleBufferDelegate(self, queue: self.videoQueue)
-                if self.session.canAddOutput(self.videoOutput) {
-                    self.session.addOutput(self.videoOutput)
+                // 不设置任何 sessionPreset：macOS 没有 inputPriority，主动设 .high 之类
+                // 只会让 session 更积极地去重配设备格式。保持默认即可。
+                if let existing = self.currentVideoInput {
+                    self.session.removeInput(existing)
+                    self.currentVideoInput = nil
                 }
-            }
-            if !self.session.outputs.contains(self.audioPreview),
-               self.session.canAddOutput(self.audioPreview) {
-                self.session.addOutput(self.audioPreview)
-            }
-
-            do {
-                let vInput = try AVCaptureDeviceInput(device: device)
-                if self.session.canAddInput(vInput) {
-                    self.session.addInput(vInput)
-                    self.currentVideoInput = vInput
+                if let existing = self.currentAudioInput {
+                    self.session.removeInput(existing)
+                    self.currentAudioInput = nil
                 }
-            } catch {
-                NSLog("StreamView: video input error %@", error.localizedDescription)
+
+                // 只请求像素格式、绝不指定宽高：让 VideoDataOutput 输出设备原生尺寸。
+                self.videoOutput.videoSettings = [
+                    kCVPixelBufferPixelFormatTypeKey as String: self.resolveOutputFormat()
+                ]
+                self.videoOutput.alwaysDiscardsLateVideoFrames = true
+                if !self.session.outputs.contains(self.videoOutput) {
+                    self.videoOutput.setSampleBufferDelegate(self, queue: self.videoQueue)
+                    if self.session.canAddOutput(self.videoOutput) {
+                        self.session.addOutput(self.videoOutput)
+                    }
+                }
+                if !self.session.outputs.contains(self.audioPreview),
+                   self.session.canAddOutput(self.audioPreview) {
+                    self.session.addOutput(self.audioPreview)
+                }
+
+                do {
+                    let vInput = try AVCaptureDeviceInput(device: device)
+                    if self.session.canAddInput(vInput) {
+                        self.session.addInput(vInput)
+                        self.currentVideoInput = vInput
+                    }
+                } catch {
+                    inputError = error
+                }
+
+                if inputError == nil {
+                    let audioMatch = self.audioDevices().first(where: {
+                        $0.localizedName == device.localizedName
+                            || $0.localizedName.localizedCaseInsensitiveContains(device.localizedName)
+                    }) ?? AVCaptureDevice.default(for: .audio)
+
+                    if let audio = audioMatch,
+                       let aInput = try? AVCaptureDeviceInput(device: audio),
+                       self.session.canAddInput(aInput) {
+                        self.session.addInput(aInput)
+                        self.currentAudioInput = aInput
+                    }
+                }
+
                 self.session.commitConfiguration()
+
+                guard inputError == nil else { return }
+
+                // 2) output 已加入 session，此时枚举列表才完整
+                self.rebuildOutputFormatList()
+                let resolvedKey = self.rebuildFormatList(for: device)
+
+                // 3) 锁内设定我们选的 activeFormat + 帧时长（含按用户选择重设 videoSettings）
+                self.setActiveFormatLocked(on: device, key: resolvedKey)
+                self.applyAudioVolume(self.settings.captureSnapshot())
+
+                // 4) 锁内启动 —— 关键：不能先解锁再 startRunning
+                if !self.session.isRunning {
+                    self.session.startRunning()
+                }
+            }   // ← 此处才 unlockForConfiguration()
+
+            guard locked else { return }
+            if let inputError {
+                NSLog("StreamView: video input error %@", inputError.localizedDescription)
                 return
             }
 
-            let audioMatch = self.audioDevices().first(where: {
-                $0.localizedName == device.localizedName
-                    || $0.localizedName.localizedCaseInsensitiveContains(device.localizedName)
-            }) ?? AVCaptureDevice.default(for: .audio)
-
-            if let audio = audioMatch,
-               let aInput = try? AVCaptureDeviceInput(device: audio),
-               self.session.canAddInput(aInput) {
-                self.session.addInput(aInput)
-                self.currentAudioInput = aInput
-            }
-
-            self.session.commitConfiguration()
-
-            // ── 第 2 步：枚举能力、锁定 activeFormat（必须在 startRunning 之前）──
-            self.currentDevice = device
-            self.rebuildOutputFormatList()          // output 已加入 session，此时列表才完整
-            let resolvedKey = self.rebuildFormatList(for: device)
-            self.applyActiveFormat(on: device, key: resolvedKey)   // 内部按用户选择重设 videoSettings
-            self.applyAudioVolume(self.settings.captureSnapshot())
-
-            // ── 第 3 步：启动，然后回读设备真实 activeFormat 做校验 ──
-            if !self.session.isRunning {
-                self.session.startRunning()
-            }
+            // 5) 解锁后回读真实 activeFormat，并做一次延迟兜底校验
             self.verifyActiveFormat(on: device)
+            self.scheduleDelayedReverify(for: device)
 
             DispatchQueue.main.async {
                 self.isRunning = true
                 self.currentDeviceID = device.uniqueID
             }
         }
+    }
+
+    /// macOS 专用：把「会触发 session 自动重配 activeFormat」的操作整体放在设备锁内。
+    /// inputPriority 在 macOS 不可用（API_UNAVAILABLE(macos)），这是唯一可靠替代。
+    @discardableResult
+    private func withDeviceLock(_ device: AVCaptureDevice, _ body: () -> Void) -> Bool {
+        do {
+            try device.lockForConfiguration()
+        } catch {
+            NSLog("StreamView: lockForConfiguration failed: %@", error.localizedDescription)
+            return false
+        }
+        defer { device.unlockForConfiguration() }
+        body()
+        return true
     }
 
     // MARK: - 输出像素格式（AVCaptureVideoDataOutput 层）
@@ -374,12 +405,18 @@ final class CaptureController: NSObject, ObservableObject {
     }
 
     private func applyOutputPixelFormatOnSessionQueue() {
+        guard let device = currentDevice else { return }
         let code = resolveOutputFormat()
-        self.session.beginConfiguration()
-        self.videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: code
-        ]
-        self.session.commitConfiguration()
+
+        // 改 output 的 videoSettings 也可能让 session 重配设备格式，
+        // 因此同样放在设备锁内，并重设一次 activeFormat 作为兜底。
+        self.withDeviceLock(device) {
+            self.videoOutput.videoSettings = [
+                kCVPixelBufferPixelFormatTypeKey as String: code
+            ]
+            self.setActiveFormatLocked(on: device,
+                                       key: self.settings.captureSnapshot().formatKey)
+        }
 
         self.frameQueue.flush()
         self.lastFrameSignature = nil
@@ -458,70 +495,104 @@ final class CaptureController: NSObject, ObservableObject {
         }
     }
 
-    /// activeFormat + 帧时长必须包在 session 的 begin/commitConfiguration 之间
-    /// （Apple 官方要求），否则运行中的 session 随时可能把它重配掉。
+    /// 运行中切换分辨率：只需设备锁，不要用 session.begin/commitConfiguration 包裹。
+    /// macOS 上 commitConfiguration() 恰恰是 session 按 preset 重配设备格式的触发点之一，
+    /// 包起来等于主动把刚设好的 activeFormat 又冲掉（这正是 1440p 掉回 720p 的原因）。
     private func applyActiveFormat(on device: AVCaptureDevice, key: String) {
-        self.lastAppliedFormatKey = key
-        let chosen = key.isEmpty ? nil : formatLookup[key]
+        self.withDeviceLock(device) {
+            self.setActiveFormatLocked(on: device, key: key)
+        }
+    }
 
-        self.session.beginConfiguration()
-        defer { self.session.commitConfiguration() }
+    /// 假定调用方已持有 device 锁：设定格式、帧时长与输出像素格式。
+    private func setActiveFormatLocked(on device: AVCaptureDevice, key: String) {
+        self.lastAppliedFormatKey = key
 
         // 每次都重置，确保 videoSettings 里不残留任何宽高/缩放设置
+        let outCode = self.resolveOutputFormat()
         self.videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: self.resolveOutputFormat()
+            kCVPixelBufferPixelFormatTypeKey as String: outCode
         ]
 
-        do {
-            try device.lockForConfiguration()
-            defer { device.unlockForConfiguration() }
-
-            let best: AVCaptureDevice.Format?
-            let targetFPS: Double
-            if let chosen {
-                best = chosen
-                targetFPS = Self.maxFPS(of: chosen)
-            } else if let auto = Self.autoFormat(for: device) {
-                best = auto.format
-                targetFPS = auto.fps
-            } else {
-                best = nil
-                targetFPS = 60.0
-            }
-            guard let best else { return }
-
-            device.activeFormat = best
-
-            let ranges = best.videoSupportedFrameRateRanges
-            let range = ranges.first {
-                $0.maxFrameRate >= targetFPS - 0.1 && $0.minFrameRate <= targetFPS + 0.1
-            } ?? ranges.max(by: { $0.maxFrameRate < $1.maxFrameRate })
-
-            if let range {
-                // 用设备自己的 CMTime，不要手搓 CMTime(1,60) —— MS2109 内部时钟是 60.00024 Hz
-                device.activeVideoMinFrameDuration = range.minFrameDuration
-                device.activeVideoMaxFrameDuration = range.minFrameDuration
-            }
-
-            let dims = CMVideoFormatDescriptionGetDimensions(best.formatDescription)
-            let actualFPS = range?.maxFrameRate ?? 0
-            let subtype = Self.fourCCName(
-                CMFormatDescriptionGetMediaSubType(best.formatDescription)
-            )
-            let requested = String(format: "请求 %dx%d @ %.2f fps · %@ (mode=%@)",
-                                   dims.width, dims.height, actualFPS, subtype,
-                                   key.isEmpty ? "auto" : key)
-            DispatchQueue.main.async { [weak self] in
-                self?.activeFormatSummary = requested
-            }
-            NSLog("StreamView: %@", requested)
-        } catch {
-            NSLog("StreamView: device lock error %@", error.localizedDescription)
+        let chosen = key.isEmpty ? nil : formatLookup[key]
+        let best: AVCaptureDevice.Format?
+        let targetFPS: Double
+        if let chosen {
+            best = chosen
+            targetFPS = Self.maxFPS(of: chosen)
+        } else if let auto = Self.autoFormat(for: device) {
+            best = auto.format
+            targetFPS = auto.fps
+        } else {
+            best = nil
+            targetFPS = 60.0
         }
+        guard let best else { return }
+
+        device.activeFormat = best
+
+        let ranges = best.videoSupportedFrameRateRanges
+        let range = ranges.first {
+            $0.maxFrameRate >= targetFPS - 0.1 && $0.minFrameRate <= targetFPS + 0.1
+        } ?? ranges.max(by: { $0.maxFrameRate < $1.maxFrameRate })
+
+        if let range {
+            // 用设备自己的 CMTime，不要手搓 CMTime(1,60) —— MS2109 内部时钟是 60.00024 Hz
+            device.activeVideoMinFrameDuration = range.minFrameDuration
+            device.activeVideoMaxFrameDuration = range.minFrameDuration
+        }
+
+        let dims = CMVideoFormatDescriptionGetDimensions(best.formatDescription)
+        let actualFPS = range?.maxFrameRate ?? 0
+        let subtype = Self.fourCCName(
+            CMFormatDescriptionGetMediaSubType(best.formatDescription)
+        )
+        let requested = String(format: "请求 %dx%d @ %.2f fps · %@ · out=%@ (mode=%@)",
+                               dims.width, dims.height, actualFPS, subtype,
+                               Self.fourCCName(outCode),
+                               key.isEmpty ? "auto" : key)
+        DispatchQueue.main.async { [weak self] in
+            self?.activeFormatSummary = requested
+        }
+        NSLog("StreamView: %@", requested)
 
         // 分辨率变了，旧帧尺寸不再有效
         self.frameQueue.flush()
         self.lastFrameSignature = nil
+    }
+
+    /// 解锁后仍可能被异步重配（部分 UVC 驱动会晚一拍）。延迟 0.6 s 再回读，
+    /// 若尺寸已被改掉，按用户当前选择重新锁一次。
+    private func scheduleDelayedReverify(for device: AVCaptureDevice) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.sessionQueue.async {
+                guard let self, self.currentDevice === device else { return }
+                self.verifyAndReapplyIfNeeded(on: device)
+            }
+        }
+    }
+
+    private func verifyAndReapplyIfNeeded(on device: AVCaptureDevice) {
+        let key = settings.captureSnapshot().formatKey
+        let actual = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+        if let expected = self.expectedDimensions(for: key, on: device),
+           expected.width != actual.width || expected.height != actual.height {
+            NSLog("StreamView: activeFormat was overridden to %dx%d, re-locking",
+                  actual.width, actual.height)
+            self.applyActiveFormat(on: device, key: key)
+        }
+        self.verifyActiveFormat(on: device)
+    }
+
+    private func expectedDimensions(for key: String, on device: AVCaptureDevice) -> CMVideoDimensions? {
+        let fmt: AVCaptureDevice.Format?
+        if key.isEmpty {
+            fmt = Self.autoFormat(for: device)?.format
+        } else {
+            fmt = formatLookup[key]
+        }
+        guard let fmt else { return nil }
+        return CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
     }
 
     /// startRunning 之后回读设备真实 activeFormat，把「请求」改写成「实际生效」。
